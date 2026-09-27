@@ -10,6 +10,11 @@
 
 export type UserRole = 'startup' | 'investor';
 
+/** Runtime check for values entering the typed login boundary. */
+export function isUserRole(value: unknown): value is UserRole {
+  return value === 'startup' || value === 'investor';
+}
+
 export interface UserRecord {
   id: string;
   email: string;
