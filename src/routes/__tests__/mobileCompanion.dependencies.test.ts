@@ -1,18 +1,15 @@
 import request from 'supertest';
 import express from 'express';
 import crypto from 'crypto';
+import { createMobileCompanionRouter, __test } from '../mobileCompanion';
+import type { MobileCompanionDependencies } from '../mobileCompanion';
 import {
-  createMobileCompanionRouter,
-  __test,
-  MobileCompanionDependencies,
-} from '../mobileCompanion';
-import {
-  DeviceKeyStore,
   InMemoryDeviceKeyStore,
   generateEd25519Keypair,
   hashBody,
   buildSignaturePayload,
 } from '../../middleware/deviceSignature';
+import type { DeviceKeyStore } from '../../middleware/deviceSignature';
 import { errorHandler } from '../../middleware/errorHandler';
 
 /**
