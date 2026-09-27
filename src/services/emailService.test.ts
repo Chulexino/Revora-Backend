@@ -88,6 +88,23 @@ describe('SendGridEmailProvider', () => {
             })
         ).rejects.toThrow('SendGrid error: 401');
     });
+
+    it('uses a deterministic empty error payload when the error response is not JSON', async () => {
+        const json = jest.fn().mockRejectedValue(new Error('invalid JSON'));
+        (global.fetch as jest.Mock).mockResolvedValue({
+            ok: false,
+            status: 503,
+            json,
+        });
+
+        await expect(providerHost.send({
+            to: 'recipient@example.com',
+            subject: 'Hello',
+            body: 'World',
+        })).rejects.toThrow('SendGrid error: 503 {}');
+
+        expect(json).toHaveBeenCalledTimes(1);
+    });
 });
 
 class FakeSmtpSocket extends EventEmitter {
@@ -153,6 +170,22 @@ function createSmtpFactory(options?: {
 }
 
 describe('SmtpEmailProvider', () => {
+    it('rejects a missing host before opening a connection', () => {
+        expect(() => new SmtpEmailProvider({
+            host: '',
+            port: 587,
+            defaultFrom: 'noreply@example.com',
+        })).toThrow('SMTP_HOST is required for EMAIL_PROVIDER=smtp');
+    });
+
+    it.each([0, 65536, 587.5, Number.NaN])('rejects invalid TCP port %s', (port) => {
+        expect(() => new SmtpEmailProvider({
+            host: 'smtp.example.com',
+            port,
+            defaultFrom: 'noreply@example.com',
+        })).toThrow('SMTP_PORT must be a valid TCP port for EMAIL_PROVIDER=smtp');
+    });
+
     it('requires STARTTLS before sending credentials or message content', async () => {
         const factory = createSmtpFactory();
         const provider = new SmtpEmailProvider({
