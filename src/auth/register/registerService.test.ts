@@ -31,18 +31,19 @@ class FakeUserRepository implements IUserRepository {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-(async function run() {
+describe('RegisterService', () => {
+  it('covers registration service behaviors', async () => {
   // ── Success: creates investor with hashed password ──────────────────────────
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    const user = await svc.register('Alice@Example.COM', 'secret123');
+    const user = await svc.register('Alice@Example.COM', 'Str0ng!Key$9A');
 
     assert(user.id, 'user should have an id');
     assert.strictEqual(user.email, 'alice@example.com', 'email should be lowercased + trimmed');
     assert.strictEqual(user.role, 'investor', 'role must be investor');
 
-    const expectedHash = createHash('sha256').update('secret123').digest('hex');
+    const expectedHash = createHash('sha256').update('Str0ng!Key$9A').digest('hex');
     assert.strictEqual(repo.getStoredHash('alice@example.com'), expectedHash, 'password must be SHA-256 hashed');
   }
 
@@ -50,7 +51,7 @@ class FakeUserRepository implements IUserRepository {
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    const user = await svc.register('  bob@example.com  ', 'password1');
+    const user = await svc.register('  bob@example.com  ', 'Str0ng!Key$9A');
     assert.strictEqual(user.email, 'bob@example.com', 'leading/trailing spaces must be stripped');
   }
 
@@ -58,11 +59,11 @@ class FakeUserRepository implements IUserRepository {
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    await svc.register('carol@example.com', 'password1');
+    await svc.register('carol@example.com', 'Str0ng!Key$9A');
 
     let threw = false;
     try {
-      await svc.register('carol@example.com', 'different-password');
+      await svc.register('carol@example.com', 'An0ther!Strong$2');
     } catch (err) {
       threw = true;
       assert(err instanceof DuplicateEmailError, 'should throw DuplicateEmailError');
@@ -75,11 +76,11 @@ class FakeUserRepository implements IUserRepository {
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    await svc.register('Dave@Example.com', 'password1');
+    await svc.register('Dave@Example.com', 'Str0ng!Key$9A');
 
     let threw = false;
     try {
-      await svc.register('dave@example.com', 'password2');
+      await svc.register('dave@example.com', 'An0ther!Strong$2');
     } catch (err) {
       threw = true;
       assert(err instanceof DuplicateEmailError, 'duplicate check is case-insensitive');
@@ -87,16 +88,20 @@ class FakeUserRepository implements IUserRepository {
     assert(threw, 'should have thrown on case-variant duplicate');
   }
 
-  // ── Different users can register independently ──────────────────────────────
+  // ── Weak password throws error ───────────────────────────────────────────────
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    const u1 = await svc.register('eve@example.com', 'password-eve');
-    const u2 = await svc.register('frank@example.com', 'password-frank');
 
-    assert.notStrictEqual(u1.id, u2.id, 'each user gets a unique id');
-    assert.strictEqual(u1.role, 'investor');
-    assert.strictEqual(u2.role, 'investor');
+    let threw = false;
+    try {
+      await svc.register('weak@example.com', 'short');
+    } catch (err) {
+      threw = true;
+      assert(err instanceof Error, 'should throw Error for weak password');
+      assert((err as Error).message.includes('Password does not meet strength requirements'), 'error message should mention strength');
+    }
+    assert(threw, 'should have thrown for weak password');
   }
 
   // ── Repository error propagates ───────────────────────────────────────────────
@@ -108,13 +113,12 @@ class FakeUserRepository implements IUserRepository {
     const svc = new RegisterService(failRepo);
     let threw = false;
     try {
-      await svc.register('grace@example.com', 'password1');
+      await svc.register('grace@example.com', 'Str0ng!Key$9A');
     } catch (err) {
       threw = true;
       assert(err instanceof Error && err.message === 'DB connection lost');
     }
     assert(threw, 'DB error should propagate');
   }
-
-  console.log('registerService tests passed');
-})();
+  });
+});

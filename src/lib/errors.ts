@@ -1,159 +1,175 @@
-import { NextFunction } from 'express';
-
-// ─── Error codes ──────────────────────────────────────────────────────────────
-
 /** Exhaustive set of machine-readable error codes used across the API. */
 export const ErrorCode = {
-  /** One or more input fields failed validation (HTTP 400). */
-  VALIDATION_ERROR: 'VALIDATION_ERROR',
-  /** Generic malformed or unacceptable request (HTTP 400). */
-  BAD_REQUEST: 'BAD_REQUEST',
-  /** Authentication is required or the supplied credentials are invalid (HTTP 401). */
-  UNAUTHORIZED: 'UNAUTHORIZED',
-  /** Authenticated but not permitted to access the resource (HTTP 403). */
-  FORBIDDEN: 'FORBIDDEN',
-  /** The requested resource does not exist (HTTP 404). */
-  NOT_FOUND: 'NOT_FOUND',
-  /** Resource-state conflict, e.g. duplicate entry (HTTP 409). */
-  CONFLICT: 'CONFLICT',
-  /** Unexpected server-side failure (HTTP 500). */
-  INTERNAL_ERROR: 'INTERNAL_ERROR',
+  VALIDATION_ERROR: "VALIDATION_ERROR",
+  BAD_REQUEST: "BAD_REQUEST",
+  UNAUTHORIZED: "UNAUTHORIZED",
+  FORBIDDEN: "FORBIDDEN",
+  NOT_FOUND: "NOT_FOUND",
+  CONFLICT: "CONFLICT",
+  SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+  TOO_MANY_REQUESTS: "TOO_MANY_REQUESTS",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
-// ─── Wire shape ───────────────────────────────────────────────────────────────
-
-/**
- * Standard JSON body returned to the client for every error response.
- *
- * ```json
- * { "code": "VALIDATION_ERROR", "message": "limit must be a positive integer", "details": { "field": "limit" } }
- * ```
- */
+/** Standard JSON body returned to clients for structured API errors. */
 export interface ErrorResponse {
   code: ErrorCode;
   message: string;
   details?: unknown;
+  requestId?: string;
 }
 
-// ─── AppError ─────────────────────────────────────────────────────────────────
-
 /**
- * Structured application error.  Throw this (or pass it to `next()`) anywhere
- * in the request lifecycle; the global error handler will serialise it using
- * {@link ErrorResponse} and set the correct HTTP status code.
- */
-export class AppError extends Error {
-  readonly code: ErrorCode;
-  readonly statusCode: number;
-  readonly details?: unknown;
-
-  constructor(
-    code: ErrorCode,
-    message: string,
-    statusCode: number,
-    details?: unknown,
-  ) {
-    super(message);
-    this.name = 'AppError';
-    this.code = code;
-    this.statusCode = statusCode;
-    this.details = details;
-    // Restore prototype chain so `instanceof AppError` works after transpilation.
-    Object.setPrototypeOf(this, AppError.prototype);
-  }
-
-  /** Serialise to the standard {@link ErrorResponse} wire shape. */
-  toResponse(): ErrorResponse {
-    const body: ErrorResponse = { code: this.code, message: this.message };
-    if (this.details !== undefined) {
-      body.details = this.details;
-    }
-    return body;
-  }
-}
-
-// ─── Factory ──────────────────────────────────────────────────────────────────
-
-/**
- * Build an {@link AppError} with an explicit status code.
- * Prefer the {@link Errors} convenience object for common cases.
+ * Creates a structured error object.
  */
 export function createError(
   code: ErrorCode,
   message: string,
   statusCode: number,
   details?: unknown,
+  options?: { expose?: boolean; isOperational?: boolean }
 ): AppError {
-  return new AppError(code, message, statusCode, details);
+  return new AppError(code, statusCode, message, details, options);
 }
 
-// ─── Convenience factories ────────────────────────────────────────────────────
-
 /**
- * Pre-built factories for the most common error scenarios.
- *
- * @example
- *   throw Errors.notFound('Offering not found');
- *   next(Errors.unauthorized());
+ * Base class for all application-specific errors.
+ * Provides a consistent structure for error handling, including HTTP status codes.
  */
+export class AppError extends Error {
+  public readonly code: ErrorCode;
+  public readonly statusCode: number;
+  public readonly details?: unknown;
+  public readonly expose: boolean;
+  public readonly isOperational: boolean;
+
+  constructor(
+    code: ErrorCode,
+    statusCode: number,
+    message: string,
+    details?: unknown,
+    options: { expose?: boolean; isOperational?: boolean } = {},
+  ) {
+    super(message);
+    Object.setPrototypeOf(this, new.target.prototype);
+    this.name = 'AppError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+    this.expose = options.expose ?? true;
+    this.isOperational = options.isOperational ?? true;
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  public toResponse(requestId?: string): ErrorResponse {
+    return {
+      code: this.code,
+      message: this.message,
+      ...(this.details !== undefined ? { details: this.details } : {}),
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message: string = 'Not Found') {
+    super(ErrorCode.NOT_FOUND, 404, message);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message: string = 'Unauthorized') {
+    super(ErrorCode.UNAUTHORIZED, 401, message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+/** Convenience factories for common error scenarios. */
 export const Errors = {
-  /** Input validation failed – HTTP 400. */
   validationError: (message: string, details?: unknown): AppError =>
     createError(ErrorCode.VALIDATION_ERROR, message, 400, details),
 
-  /** Generic bad request – HTTP 400. */
   badRequest: (message: string, details?: unknown): AppError =>
     createError(ErrorCode.BAD_REQUEST, message, 400, details),
 
-  /** Authentication required or credentials invalid – HTTP 401. */
-  unauthorized: (message = 'Unauthorized'): AppError =>
+  unauthorized: (message = "Unauthorized"): AppError =>
     createError(ErrorCode.UNAUTHORIZED, message, 401),
 
-  /** Authenticated but not permitted – HTTP 403. */
-  forbidden: (message = 'Forbidden'): AppError =>
+  forbidden: (message = "Forbidden"): AppError =>
     createError(ErrorCode.FORBIDDEN, message, 403),
 
-  /** Resource not found – HTTP 404. */
-  notFound: (message: string): AppError =>
+  notFound: (message = "Not found"): AppError =>
     createError(ErrorCode.NOT_FOUND, message, 404),
 
-  /** Resource-state conflict – HTTP 409. */
-  conflict: (message: string): AppError =>
-    createError(ErrorCode.CONFLICT, message, 409),
+  conflict: (message: string, details?: unknown): AppError =>
+    createError(ErrorCode.CONFLICT, message, 409, details),
 
-  /** Unexpected server error – HTTP 500. */
-  internal: (message = 'Internal server error', details?: unknown): AppError =>
-    createError(ErrorCode.INTERNAL_ERROR, message, 500, details),
+  serviceUnavailable: (
+    message = "Service unavailable",
+    details?: unknown,
+  ): AppError =>
+    createError(ErrorCode.SERVICE_UNAVAILABLE, message, 503, details),
+
+  internal: (messageOrDetails?: unknown, details?: unknown): AppError => {
+    const hasCustomMessage = typeof messageOrDetails === "string";
+    return createError(
+      ErrorCode.INTERNAL_ERROR,
+      hasCustomMessage ? messageOrDetails : "Internal server error",
+      500,
+      hasCustomMessage ? details : messageOrDetails,
+      { expose: false },
+    );
+  },
+
+  tooManyRequests: (
+    message = "Too many requests",
+    details?: unknown,
+  ): AppError =>
+    createError(ErrorCode.TOO_MANY_REQUESTS, message, 429, details),
 };
 
-// ─── Route helpers ────────────────────────────────────────────────────────────
-
-/**
- * Throw an {@link AppError} immediately.  Use inside `try/catch` blocks or
- * async route handlers where Express will catch the thrown error.
- *
- * @example
- *   if (!offering) throwError(ErrorCode.NOT_FOUND, 'Offering not found', 404);
- */
 export function throwError(
   code: ErrorCode,
   message: string,
   statusCode: number,
   details?: unknown,
+  options?: { expose?: boolean },
 ): never {
-  throw createError(code, message, statusCode, details);
+  throw createError(code, message, statusCode, details, options);
 }
 
 /**
- * Forward a structured error to Express's `next()` so the global error
- * handler returns the standard JSON response.  Use when you need to exit
- * a middleware without throwing (e.g. inside a callback-style flow).
- *
- * @example
- *   if (!user) return sendAppError(next, Errors.unauthorized());
+ * Forwards an AppError into the express error-handling chain.
+ * @dev Express treats a 4-argument middleware as an error handler; calling
+ *      next(err) routes the error to that handler (or the default one), which
+ *      formats it into a standard ErrorResponse. This helper exists to make the
+ *      forwarding intent explicit and unit-testable.
  */
-export function sendAppError(next: NextFunction, error: AppError): void {
-  next(error);
+export function sendAppError(
+  next: (err?: unknown) => void,
+  err: AppError | Error,
+): void {
+  next(err);
+}
+
+export class BadRequestError extends AppError {
+  constructor(message: string = 'Bad Request') {
+    super(ErrorCode.BAD_REQUEST, 400, message);
+    this.name = 'BadRequestError';
+  }
+}
+
+export class UniqueConstraintError extends Error {
+  public readonly field: string;
+
+  constructor(field: string) {
+    super(`Duplicate value for field: ${field}`);
+    Object.setPrototypeOf(this, new.target.prototype);
+    this.name = 'UniqueConstraintError';
+    this.field = field;
+    Error.captureStackTrace(this, this.constructor);
+  }
 }

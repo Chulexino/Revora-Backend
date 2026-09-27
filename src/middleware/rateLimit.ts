@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
+import { Errors } from '../lib/errors';
 
 export interface RateLimitOptions {
   /** Maximum number of requests allowed within the window. Default: 100 */
@@ -8,8 +9,20 @@ export interface RateLimitOptions {
   /** If true, key is derived from req.user?.sub (authenticated routes).
    *  If false (default), key is derived from the client IP (public routes). */
   perUser?: boolean;
+  /**
+   * If true, key is derived from `(req as any).socialProviderSub` which must
+   * be set by upstream middleware to a string of the form `"<provider>:<sub>"`.
+   * Falls through to IP-based keying when the property is absent.
+   *
+   * Security assumption: the property is populated **only after** the provider
+   * ID-token has been cryptographically verified, preventing an attacker from
+   * supplying an arbitrary subject to exhaust another identity's bucket.
+   */
+  perProviderSub?: boolean;
   /** Optional message to send when limit is exceeded. */
   message?: string;
+  /** Optional key prefix to isolate counters across independent policies. */
+  keyPrefix?: string;
 }
 
 interface WindowEntry {
@@ -33,6 +46,8 @@ export interface RateLimitStore {
   increment(key: string, windowMs: number): { count: number; resetAt: number };
   /** Reset the counter for `key` (useful in tests). */
   reset(key: string): void;
+  /** Clear all counters (test helper). */
+  clear?(): void;
 }
 
 export class InMemoryRateLimitStore implements RateLimitStore {
@@ -55,6 +70,10 @@ export class InMemoryRateLimitStore implements RateLimitStore {
 
   reset(key: string): void {
     this.windows.delete(key);
+  }
+
+  clear(): void {
+    this.windows.clear();
   }
 }
 
@@ -102,7 +121,9 @@ export function createRateLimitMiddleware(options: RateLimitOptions & { store?: 
     limit = 100,
     windowMs = 60_000,
     perUser = false,
+    perProviderSub = false,
     message = 'Too many requests, please try again later.',
+    keyPrefix = '',
     store = defaultStore,
   } = options;
 
@@ -110,7 +131,22 @@ export function createRateLimitMiddleware(options: RateLimitOptions & { store?: 
     // ── Resolve the rate-limit key ────────────────────────────────────────
     let key: string | undefined;
 
-    if (perUser) {
+    if (perProviderSub) {
+      // Relies on upstream middleware (e.g. socialAntiEnumerationMiddleware)
+      // having set req.socialProviderSub after token verification.
+      const providerSub = (req as any).socialProviderSub as string | undefined;
+      if (providerSub) {
+        key = `provider-sub:${providerSub}`;
+      } else {
+        // Fall through to IP-based keying when the property is absent
+        // (e.g. before token parsing succeeds — still apply a guard).
+        const ip =
+          (req.ip) ||
+          (req.socket?.remoteAddress) ||
+          'unknown';
+        key = `ip:${ip}`;
+      }
+    } else if (perUser) {
       // Relies on upstream auth middleware having set req.user
       const user = (req as any).user as { sub?: string } | undefined;
       key = user?.sub;
@@ -133,7 +169,8 @@ export function createRateLimitMiddleware(options: RateLimitOptions & { store?: 
     }
 
     // ── Check & increment the counter ─────────────────────────────────────
-    const { count, resetAt } = store.increment(key, windowMs);
+    const scopedKey = keyPrefix ? `${keyPrefix}:${key}` : key;
+    const { count, resetAt } = store.increment(scopedKey, windowMs);
     const remaining = Math.max(0, limit - count);
     const resetSecs = Math.ceil(resetAt / 1000);
 
@@ -144,12 +181,7 @@ export function createRateLimitMiddleware(options: RateLimitOptions & { store?: 
 
     if (count > limit) {
       res.setHeader('Retry-After', String(resetSecs - Math.ceil(Date.now() / 1000)));
-      res.status(429).json({
-        error: 'TooManyRequests',
-        message,
-        retryAfter: resetSecs,
-      });
-      return;
+      return next(Errors.tooManyRequests(message, { retryAfter: resetSecs }));
     }
 
     next();

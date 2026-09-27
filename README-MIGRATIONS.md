@@ -1,39 +1,16 @@
-# Managing Database Migrations
+# Database Migrations
 
-This project uses a custom raw SQL migration script to manage database schema changes reliably.
+## Prefix Numbering Rule
 
-## Structure
+All database migrations must follow a strict prefix numbering convention to ensure deterministic execution order and prevent collisions.
 
-- `src/db/migrations/`: Directory where all `.sql` migration files are stored.
-- `src/db/migrate.ts`: The script that executes pending migrations against the database. 
+### Rules
 
-## Creating Migrations
+1. **Numeric Prefix**: Every migration file MUST begin with a numeric prefix followed by an underscore (e.g., `001_create_users.sql`).
+2. **Sequential Ordering**: The prefixes MUST be strictly monotonic and strictly increasing.
+3. **No Duplicates**: Duplicate prefixes are NOT allowed. If two developers create a migration at the same time with the same prefix, one must be renamed during the merge process.
+4. **No Out-of-Band Migrations**: The `999_*` prefix is flagged as an out-of-band prefix and is rejected by the system.
+5. **Extension**: All migration files MUST have the `.sql` extension.
+6. **Hidden Files**: Hidden files (starting with `.`) are ignored.
 
-To add a new migration, create a new `.sql` file in `src/db/migrations/`. 
-
-**Naming Convention:** 
-Use a sequential prefix followed by a descriptive name: `XXX_description.sql` (e.g., `003_add_user_status.sql`). 
-
-All `.sql` files are sorted alphabetically when applied, so the prefix ensures they run in the correct order. The migration script uses a `schema_version` table to track which files have already been applied based on their filename.
-
-## Running Migrations
-
-Migrations rely on the `DATABASE_URL` environment variable.
-
-1. Ensure your `.env` file has a valid `DATABASE_URL`:
-   ```env
-   DATABASE_URL="postgres://user:password@localhost:5432/revora"
-   ```
-2. Run the migration script via npm:
-   ```bash
-   npm run migrate
-   ```
-
-This command will:
-1. Compile the TypeScript code (`tsc`).
-2. Connect to the database specified by `DATABASE_URL`.
-3. Create the `schema_version` table if it doesn't already exist.
-4. Apply any `.sql` file in `src/db/migrations/` that hasn't been recorded in `schema_version`, within a transaction.
-5. Record the applied filename in `schema_version`.
-
-If a migration fails mid-execution, the transaction will rollback, leaving your database safely unmodified.
+These rules are enforced by the `resolveMigrations` function in `src/db/migrate.js` during the test run and at startup. A duplicate numeric prefix or non-monotonic ordering will fail the test run with a clear diagnostic.

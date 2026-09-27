@@ -5,25 +5,29 @@ import { Pool, QueryResult } from 'pg';
  */
 export interface AuditLog {
   id: string;
-  user_id?: string;
+  user_id?: string | null;
   action: string;
-  resource?: string;
-  details?: string;
-  ip_address?: string;
-  user_agent?: string;
+  resource?: string | null;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
   created_at: Date;
+  /** Hash of the previous row in the tamper-evident chain (genesis for first row). */
+  prev_hash?: string;
+  /** SHA-256 hash of canonical row payload linked to prev_hash. */
+  row_hash?: string;
 }
 
 /**
  * Audit Log input for creation
  */
 export interface CreateAuditLogInput {
-  user_id?: string;
+  user_id?: string | null;
   action: string;
-  resource?: string;
-  details?: string;
-  ip_address?: string;
-  user_agent?: string;
+  resource?: string | null;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
 }
 
 /**
@@ -131,6 +135,69 @@ export class AuditLogRepository {
       ip_address: row.ip_address,
       user_agent: row.user_agent,
       created_at: row.created_at,
+      prev_hash: row.prev_hash,
+      row_hash: row.row_hash,
     };
+  }
+
+  /**
+   * Purge audit logs created before a specific date.
+   *
+   * Rows whose UTC `YYYY-MM` period has an active legal hold in
+   * `retention_labels` are skipped and counted separately.
+   */
+  async purgeBefore(cutoffDate: Date): Promise<{
+    deletedCount: number;
+    skippedHoldCount: number;
+  }> {
+    const skippedResult = await this.db.query<{ count: string | number }>(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM audit_logs a
+      WHERE a.created_at < $1
+        AND EXISTS (
+          SELECT 1
+          FROM retention_labels rl
+          WHERE rl.legal_hold = TRUE
+            AND rl.period_id = to_char((a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM')
+        )
+      `,
+      [cutoffDate],
+    );
+
+    const deleteResult = await this.db.query(
+      `
+      DELETE FROM audit_logs a
+      WHERE a.created_at < $1
+        AND NOT EXISTS (
+          SELECT 1
+          FROM retention_labels rl
+          WHERE rl.legal_hold = TRUE
+            AND rl.period_id = to_char((a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM')
+        )
+      `,
+      [cutoffDate],
+    );
+
+    return {
+      deletedCount: deleteResult.rowCount ?? 0,
+      skippedHoldCount: Number(skippedResult.rows[0]?.count ?? 0),
+    };
+  }
+
+  /**
+   * Get audit logs for CSV export (paginated)
+   * @param limit Number of rows to return
+   * @param offset Offset to start from
+   * @returns Array of audit logs
+   */
+  async getAuditLogsForExport(limit: number, offset: number): Promise<AuditLog[]> {
+    const query = `
+      SELECT * FROM audit_logs
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+    const result = await this.db.query(query, [limit, offset]);
+    return result.rows.map((row) => this.mapAuditLog(row));
   }
 }

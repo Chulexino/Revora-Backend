@@ -1,168 +1,509 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { env } from '../config/env';
+import { globalLogger, Logger } from '../lib/logger';
+import { Errors, AppError } from '../lib/errors';
+import { 
+  classifyStellarRPCFailure, 
+  StellarRPCFailure, 
+  StellarRPCFailureContext,
+  StellarRPCFailureClass,
+  shouldRetryStellarRPCFailure,
+  createStellarErrorResponse
+} from '../lib/stellarRpcFailure';
+
+const logger = globalLogger.child({ service: 'stellar-submission' });
 
 /**
  * Service for building and submitting Stellar transactions.
+ * 
+ * Features:
+ * - Retry logic with exponential backoff and idempotency
+ * - Comprehensive RPC failure classification
+ * - Structured logging and error handling
+ * - Transaction deduplication prevention
  */
 export class StellarSubmissionService {
-    private server: StellarSdk.rpc.Server;
-    private keypair: StellarSdk.Keypair;
-
-    constructor() {
-        const horizonUrl = env.STELLAR_HORIZON_URL || (env.STELLAR_NETWORK === 'public'
-            ? 'https://horizon.stellar.org'
-            : 'https://horizon-testnet.stellar.org');
-
-        this.server = new StellarSdk.rpc.Server(horizonUrl);
-
-        const secret = process.env.STELLAR_SERVER_SECRET;
-        if (!secret) {
-            throw new Error('STELLAR_SERVER_SECRET is not defined in environment variables');
-        }
-
-        try {
-            this.keypair = StellarSdk.Keypair.fromSecret(secret);
-        } catch (error) {
-            throw new Error('Invalid STELLAR_SERVER_SECRET provided');
-        }
-    }
-
-    /**
-     * Submits a simple payment transaction.
-     * @param to Destination public key
-     * @param amount Amount to send (as string)
-     * @param asset Asset to send (defaults to native XLM)
-     * @returns Transaction result
-     */
-    async submitPayment(
-        to: string,
-        amount: string,
-        asset: StellarSdk.Asset = StellarSdk.Asset.native()
-    ) {
-        const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
-
-        const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-            fee: StellarSdk.BASE_FEE,
-            networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE || (env.STELLAR_NETWORK === 'public'
-                ? StellarSdk.Networks.PUBLIC
-                : StellarSdk.Networks.TESTNET),
-        })
-            .addOperation(StellarSdk.Operation.payment({
-                destination: to,
-                asset: asset,
-                amount: amount,
-            }))
-            .setTimeout(30)
-            .build();
-
-        transaction.sign(this.keypair);
-
-        return this.server.sendTransaction(transaction);
-    }
-
-    /**
-     * Invokes a Soroban contract (placeholder for logic).
-     * @param contractId The ID of the contract to invoke
-     * @param functionName The name of the function to call
-     * @param args The arguments to pass to the function
-     * @returns Submission result
-     */
-    async invokeContract(
-        contractId: string,
-        functionName: string,
-        args: any[] = []
-    ) {
-        // Note: Soroban contract invocation requires additional setup (TransactionBuilder for Soroban)
-        // This is a simplified version or placeholder as requested in 'optionally'
-        const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
-
-        // In a real implementation, you'd use Contract.call or similar from @stellar/stellar-sdk
-        // For now, we provide the structure as a starting point
-        console.log(`Invoking contract ${contractId} function ${functionName} with args`, args);
-
-        // Placeholder logic for contract invocation
-        throw new Error('Soroban contract invocation logic requires specific setup');
-    }
-
-    /**
-     * Gets the public key of the service's keypair.
-     */
-    getPublicKey(): string {
-        return this.keypair.publicKey();
-    }
-}
-import * as StellarSdk from 'stellar-sdk';
-import { env } from '../config/env';
-
-/**
- * StellarSubmissionService handles building and submitting transactions to the Stellar network.
- * It uses the server's secret key for signing.
- */
-export class StellarSubmissionService {
-  private server: StellarSdk.Horizon.Server;
+  private server: StellarSdk.rpc.Server;
   private keypair: StellarSdk.Keypair;
-  private networkPassphrase: string;
+  private logger = globalLogger.child({ service: 'stellar-submission' });
+  private submittedTransactionHashes = new Set<string>();
+  private idempotencyResults = new Map<string, StellarSdk.rpc.Api.SendTransactionResponse>();
+  private inFlightIdempotencyKeys = new Map<string, Promise<StellarSdk.rpc.Api.SendTransactionResponse>>();
+  private maxRetries = 3;
+  private baseDelayMs = 1000;
+  private maxDelayMs = 30000;
 
   constructor() {
-    const horizonUrl = env.STELLAR_HORIZON_URL || (env.STELLAR_NETWORK === 'public' 
-      ? 'https://horizon.stellar.org' 
-      : 'https://horizon-testnet.stellar.org');
-    
-    this.server = new StellarSdk.Horizon.Server(horizonUrl);
-    
-    const secret = process.env.STELLAR_SERVER_SECRET;
+    const horizonUrl =
+      env.STELLAR_HORIZON_URL ||
+      (env.STELLAR_NETWORK === 'public'
+        ? 'https://horizon.stellar.org'
+        : 'https://horizon-testnet.stellar.org');
+
+    this.server = new StellarSdk.rpc.Server(horizonUrl);
+
+    const secret = env.STELLAR_SERVER_SECRET;
     if (!secret) {
-      throw new Error('STELLAR_SERVER_SECRET environment variable is not set');
+      throw Errors.internal('STELLAR_SERVER_SECRET is not defined in environment variables');
     }
-    this.keypair = StellarSdk.Keypair.fromSecret(secret);
-    
-    this.networkPassphrase = env.STELLAR_NETWORK_PASSPHRASE || (env.STELLAR_NETWORK === 'public'
-      ? StellarSdk.Networks.PUBLIC
-      : StellarSdk.Networks.TESTNET);
+
+    try {
+      this.keypair = StellarSdk.Keypair.fromSecret(secret);
+    } catch {
+      throw Errors.internal('Invalid STELLAR_SERVER_SECRET provided');
+    }
+
+    this.logger.info('Stellar submission service initialized', {
+      serverUrl: horizonUrl,
+      publicKey: this.keypair.publicKey(),
+      network: env.STELLAR_NETWORK,
+      maxFee: env.STELLAR_MAX_FEE,
+    });
   }
 
   /**
-   * Submits a simple payment transaction.
-   * @param to Destination Stellar address.
-   * @param amount Amount to send (in string format).
-   * @param asset Asset to send (defaults to native XLM).
+   * Submits a simple payment transaction with enhanced error handling and idempotency.
+   * @param to Destination public key
+   * @param amount Amount to send (as string)
+   * @param asset Asset to send (defaults to native XLM)
+   * @param idempotencyKey Optional key to prevent duplicate submissions
+   * @returns Transaction result
    */
-  async submitPayment(to: string, amount: string, asset: StellarSdk.Asset = StellarSdk.Asset.native()): Promise<StellarSdk.Horizon.SubmitTransactionResponse> {
+  async submitPayment(
+    to: string,
+    amount: string,
+    asset: StellarSdk.Asset = StellarSdk.Asset.native(),
+    idempotencyKey?: string,
+  ) {
+    if (!to || typeof to !== 'string') {
+      throw Errors.validationError('Destination public key must be a non-empty string');
+    }
+    if (!amount || typeof amount !== 'string') {
+      throw Errors.validationError('Amount must be a non-empty string');
+    }
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '')) {
+      throw Errors.validationError('Idempotency key must be a non-empty string when provided');
+    }
+
+    const normalizedIdempotencyKey = idempotencyKey?.trim();
+    if (normalizedIdempotencyKey) {
+      const cachedResult = this.idempotencyResults.get(normalizedIdempotencyKey);
+      if (cachedResult) {
+        this.logger.info('Returning cached Stellar transaction submission result', {
+          operation: 'submit_payment',
+          hasIdempotencyKey: true,
+          transactionHash: cachedResult.hash,
+        });
+        return cachedResult;
+      }
+
+      const inFlight = this.inFlightIdempotencyKeys.get(normalizedIdempotencyKey);
+      if (inFlight) {
+        this.logger.info('Joining in-flight Stellar transaction submission', {
+          operation: 'submit_payment',
+          hasIdempotencyKey: true,
+        });
+        return inFlight;
+      }
+
+      const submission = this.submitPaymentOnce(to, amount, asset, normalizedIdempotencyKey);
+      this.inFlightIdempotencyKeys.set(normalizedIdempotencyKey, submission);
+
+      try {
+        const result = await submission;
+        this.idempotencyResults.set(normalizedIdempotencyKey, result);
+        return result;
+      } finally {
+        this.inFlightIdempotencyKeys.delete(normalizedIdempotencyKey);
+      }
+    }
+
+    return this.submitPaymentOnce(to, amount, asset);
+  }
+
+  private async submitPaymentOnce(
+    to: string,
+    amount: string,
+    asset: StellarSdk.Asset,
+    idempotencyKey?: string,
+  ): Promise<StellarSdk.rpc.Api.SendTransactionResponse> {
+
+    this.logger.info('Submitting payment transaction', {
+      to,
+      amount,
+      asset: asset.isNative() ? 'XLM' : asset.code,
+      hasIdempotencyKey: Boolean(idempotencyKey),
+    });
+
     try {
-      const account = await this.server.loadAccount(this.keypair.publicKey());
-      
-      const transaction = new StellarSdk.TransactionBuilder(account, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
+      const sourceAccount = await this.getAccountWithRetry(this.keypair.publicKey(), {
+        operation: 'get_account',
+        network: env.STELLAR_NETWORK,
+        attemptCount: 1,
+        idempotencyKey,
+      });
+
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: env.STELLAR_MAX_FEE.toString(),
+        networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE ||
+          (env.STELLAR_NETWORK === 'public'
+            ? StellarSdk.Networks.PUBLIC
+            : StellarSdk.Networks.TESTNET),
       })
-        .addOperation(StellarSdk.Operation.payment({
-          destination: to,
-          asset,
-          amount,
-        }))
+        .addOperation(
+          StellarSdk.Operation.payment({
+            destination: to,
+            asset,
+            amount,
+          }),
+        )
         .setTimeout(30)
         .build();
 
       transaction.sign(this.keypair);
-      
-      return await this.server.submitTransaction(transaction);
+
+      // Check for idempotency to prevent duplicate submissions
+      const transactionHash = transaction.hash().toString('hex');
+      if (this.submittedTransactionHashes.has(transactionHash)) {
+        logger.warn('Duplicate transaction submission prevented', {
+          transactionHash,
+          hasIdempotencyKey: Boolean(idempotencyKey),
+          operation: 'submit_payment',
+        });
+        throw Errors.conflict('Transaction already submitted', {
+          hash: transactionHash,
+          idempotencyKey,
+        });
+      }
+
+      const result = await this.sendTransactionWithRetry(transaction, {
+        operation: 'submit_payment',
+        network: env.STELLAR_NETWORK,
+        attemptCount: 1,
+        idempotencyKey,
+      });
+
+      // Add to submitted hashes after successful submission
+      this.submittedTransactionHashes.add(transactionHash);
+
+      this.logger.info('Payment transaction submitted successfully', {
+        to,
+        amount,
+        transactionHash: result.hash,
+      });
+
+      return result;
     } catch (error) {
-      console.error('Error submitting Stellar payment:', error);
-      throw error;
+      if (error instanceof Error && error.name === 'AppError') {
+        throw error;
+      }
+
+      const failure = classifyStellarRPCFailure(error, {
+        operation: 'submit_payment',
+        network: env.STELLAR_NETWORK,
+        attemptCount: this.maxRetries,
+        idempotencyKey,
+      });
+
+      this.logStellarFailure(failure);
+      throw this.createAppErrorFromFailure(failure);
     }
   }
 
   /**
-   * Placeholder for invoking a Soroban contract.
-   * Soroban support in stellar-sdk (v11+) involves more complex setup, 
-   * but this follows the requested pattern.
+   * Invokes a Soroban contract with enhanced error handling and idempotency.
+   * @param contractId Contract ID to invoke
+   * @param functionName Function name to call
+   * @param args Function arguments
+   * @param idempotencyKey Optional key to prevent duplicate submissions
+   * @returns Transaction result
    */
-  async invokeContract(contractId: string, functionName: string, args: any[] = []): Promise<any> {
-    // This is a placeholder for Soroban contract invocation logic.
-    // In a full implementation, this would involve building a Transaction with an InvokeHostFunction operation.
-    console.log(`Invoking contract ${contractId} function ${functionName} with args:`, args);
-    throw new Error('Soroban contract invocation not fully implemented yet');
+  async invokeContract(
+    _contractId: string,
+    _functionName: string,
+    _args: any[] = [],
+  ): Promise<never> {
+    this.logger.warn('Soroban contract invocation attempted but not implemented', {
+      contractId: _contractId,
+      functionName: _functionName,
+    });
+    throw Errors.serviceUnavailable('Soroban contract invocation not implemented yet');
+  }
+
+  /**
+   * Gets the public key of the service's keypair.
+   */
+  getPublicKey(): string {
+    return this.keypair.publicKey();
+  }
+
+  /**
+   * Helper method to get account with enhanced retry logic and exponential backoff.
+   */
+  private async getAccountWithRetry(
+    publicKey: string,
+    context: StellarRPCFailureContext
+  ): Promise<any> {
+    let attemptCount = context.attemptCount || 1;
+    
+    while (attemptCount <= this.maxRetries) {
+      try {
+        const account = await this.server.getAccount(publicKey);
+        
+        // Log successful retry if applicable
+        if (attemptCount > 1) {
+          logger.info('Stellar account retrieval succeeded after retry', {
+            publicKey,
+            attemptCount,
+            operation: 'get_account',
+          });
+        }
+        
+        return account;
+      } catch (error) {
+        const failure = classifyStellarRPCFailure(error, {
+          ...context,
+          operation: 'get_account',
+          attemptCount,
+        });
+        
+        if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
+          throw this.createAppErrorFromFailure(failure);
+        }
+        
+        this.logStellarFailure(failure);
+        
+        // Calculate exponential backoff delay
+        const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+        logger.debug('Retrying Stellar account retrieval', {
+          publicKey,
+          attemptCount,
+          delayMs,
+          nextAttempt: attemptCount + 1,
+        });
+        
+        await this.delay(delayMs);
+        attemptCount++;
+      }
+    }
+    
+    throw Errors.serviceUnavailable('Failed to retrieve Stellar account after maximum retries', {
+      publicKey,
+      maxRetries: this.maxRetries,
+      operation: 'get_account',
+    });
+  }
+
+  /**
+   * Helper method to send transaction with enhanced retry logic and exponential backoff.
+   */
+  private async sendTransactionWithRetry(
+    transaction: StellarSdk.Transaction,
+    context: StellarRPCFailureContext
+  ): Promise<StellarSdk.rpc.Api.SendTransactionResponse> {
+    let attemptCount = context.attemptCount || 1;
+    const transactionHash = transaction.hash().toString('hex');
+    
+    while (attemptCount <= this.maxRetries) {
+      try {
+        const result = await this.server.sendTransaction(transaction);
+        
+        // Log successful retry if applicable
+        if (attemptCount > 1) {
+          logger.info('Stellar transaction submission succeeded after retry', {
+            transactionHash,
+            attemptCount,
+            operation: 'send_transaction',
+          });
+        }
+        
+        // Handle transaction submission results
+        if (result.status === 'PENDING') {
+          return result;
+        } else if (result.status === 'DUPLICATE') {
+          throw Errors.conflict('Transaction already submitted', {
+            hash: result.hash,
+            transactionHash,
+          });
+        } else if (result.status === 'TRY_AGAIN_LATER') {
+          const failure = classifyStellarRPCFailure(
+            { status: 429, statusText: 'TRY_AGAIN_LATER' },
+            {
+              ...context,
+              operation: 'send_transaction',
+              attemptCount,
+              transactionHash,
+            }
+          );
+
+          if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
+            throw this.createAppErrorFromFailure(failure);
+          }
+
+          this.logStellarFailure(failure);
+          const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+          logger.debug('Retrying Stellar transaction submission', {
+            transactionHash,
+            attemptCount,
+            delayMs,
+            nextAttempt: attemptCount + 1,
+            failureClass: failure.class,
+          });
+
+          await this.delay(delayMs);
+          attemptCount++;
+          continue;
+        } else {
+          throw {
+            code: 'TRANSACTION_FAILED',
+            status: result.status,
+            hash: result.hash,
+          };
+        }
+      } catch (error) {
+        // Re-throw AppErrors immediately without classification
+        if (error instanceof Error && error.name === 'AppError') {
+          throw error;
+        }
+
+        const failure = classifyStellarRPCFailure(error, {
+          ...context,
+          operation: 'send_transaction',
+          attemptCount,
+          transactionHash,
+        });
+        
+        if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
+          throw this.createAppErrorFromFailure(failure);
+        }
+        
+        this.logStellarFailure(failure);
+        
+        // Calculate exponential backoff delay
+        const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+        logger.debug('Retrying Stellar transaction submission', {
+          transactionHash,
+          attemptCount,
+          delayMs,
+          nextAttempt: attemptCount + 1,
+          failureClass: failure.class,
+        });
+        
+        await this.delay(delayMs);
+        attemptCount++;
+      }
+    }
+    
+    throw Errors.serviceUnavailable('Failed to submit Stellar transaction after maximum retries', {
+      transactionHash,
+      maxRetries: this.maxRetries,
+      operation: 'send_transaction',
+    });
+  }
+
+  /**
+   * Creates an AppError from a Stellar RPC failure.
+   */
+  private createAppErrorFromFailure(failure: StellarRPCFailure): AppError {
+    const errorResponse = createStellarErrorResponse(failure);
+    
+    switch (failure.class) {
+      case StellarRPCFailureClass.TIMEOUT:
+        return Errors.serviceUnavailable(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.RATE_LIMIT:
+        return Errors.serviceUnavailable(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.UPSTREAM_ERROR:
+        return Errors.serviceUnavailable(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.NETWORK_ERROR:
+        return Errors.serviceUnavailable(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.UNAUTHORIZED:
+        return Errors.unauthorized(errorResponse.message);
+      
+      case StellarRPCFailureClass.TRANSACTION_FAILED:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.BAD_SEQUENCE:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
+
+      case StellarRPCFailureClass.TX_RESULT_CODE:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
+
+      case StellarRPCFailureClass.OP_RESULT_CODE:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
+      
+      case StellarRPCFailureClass.SIGNING_ERROR:
+        return Errors.internal(errorResponse.message, errorResponse.details);
+      
+      default:
+        return Errors.serviceUnavailable(errorResponse.message, errorResponse.details);
+    }
+  }
+
+  /**
+   * Logs Stellar RPC failures for monitoring and debugging.
+   */
+  private logStellarFailure(failure: StellarRPCFailure): void {
+    logger.warn('Stellar RPC operation failed', {
+      failureClass: failure.class,
+      operation: failure.context.operation,
+      network: failure.context.network,
+      attemptCount: failure.context.attemptCount,
+      shouldRetry: failure.shouldRetry,
+      suggestedDelay: failure.suggestedRetryDelayMs,
+      originalError: failure.originalError,
+      contractId: failure.context.contractId,
+      functionName: failure.context.functionName,
+      transactionHash: failure.context.transactionHash,
+      hasIdempotencyKey: Boolean(failure.context.idempotencyKey),
+    });
+  }
+
+  /**
+   * Calculates retry delay with exponential backoff and jitter.
+   * @param suggestedDelayMs Suggested delay from failure classification
+   * @param attemptCount Current attempt number
+   * @returns Calculated delay in milliseconds
+   */
+  private calculateRetryDelay(suggestedDelayMs?: number, attemptCount: number = 1): number {
+    // Use suggested delay if provided, otherwise calculate exponential backoff
+    const baseDelay = suggestedDelayMs ?? this.baseDelayMs;
+    const exponentialDelay = Math.min(baseDelay * Math.pow(2, attemptCount - 1), this.maxDelayMs);
+    
+    // Add jitter to prevent thundering herd (±25% random variation)
+    const jitter = Math.random() * 0.5 - 0.25; // ±25%
+    const finalDelay = Math.round(exponentialDelay * (1 + jitter));
+    
+    return Math.max(this.baseDelayMs, finalDelay); // Ensure minimum delay
+  }
+
+  /**
+   * Utility method for delaying execution with Promise.
+   * @param ms Delay in milliseconds
+   * @returns Promise that resolves after delay
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Clears the transaction hash cache (useful for testing or memory management).
+   */
+  clearTransactionCache(): void {
+    this.submittedTransactionHashes.clear();
+    this.idempotencyResults.clear();
+    this.inFlightIdempotencyKeys.clear();
+    logger.debug('Stellar transaction cache cleared');
+  }
+
+  /**
+   * Gets the current size of the transaction hash cache.
+   * @returns Number of cached transaction hashes
+   */
+  getTransactionCacheSize(): number {
+    return this.submittedTransactionHashes.size;
   }
 }
-
-export default new StellarSubmissionService();

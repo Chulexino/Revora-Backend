@@ -1,0 +1,556 @@
+import { createHmac, timingSafeEqual } from 'crypto';
+import { globalMetrics } from './metrics';
+
+export const WEBHOOK_SIGNATURE_HEADER = 'x-revora-signature';
+export const WEBHOOK_TIMESTAMP_HEADER = 'x-revora-timestamp';
+export const WEBHOOK_EVENT_HEADER = 'x-revora-event';
+
+/**
+ * @title Webhook Signature Verification
+ * @notice Production-grade HMAC-SHA256 signature verification for incoming webhooks.
+ * @dev Implements constant-time comparison to prevent timing attacks.
+ *
+ * Security assumptions:
+ * - Secrets are cryptographically random and sufficiently long (>= 32 bytes recommended)
+ * - Secrets are stored securely and never transmitted
+ * - Signature format follows the standard: sha256=<hex>
+ * - Payload bodies are not modified between signing and verification
+ *
+ * Abuse/failure paths handled:
+ * - Missing or malformed signatures
+ * - Signature length mismatches (preventing timing attack vectors)
+ * - Invalid hex encoding in signatures
+ * - Timing attacks via constant-time comparison
+ * - Empty secrets or payloads
+ */
+
+/**
+ * @notice Error thrown when signature verification fails.
+ */
+export class WebhookSignatureError extends Error {
+  constructor(
+    message: string,
+    public readonly code: 'MISSING_SIGNATURE' | 'INVALID_FORMAT' | 'VERIFICATION_FAILED'
+  ) {
+    super(message);
+    this.name = 'WebhookSignatureError';
+    Object.setPrototypeOf(this, WebhookSignatureError.prototype);
+  }
+}
+
+/**
+ * @notice Generates an HMAC-SHA256 signature for a webhook payload.
+ * @param secret The shared secret key
+ * @param payload The raw request body (string or Buffer)
+ * @returns A signature string in the format `sha256=<hex>`
+ *
+ * @example
+ * ```typescript
+ * const signature = signWebhookPayload('my-secret', '{"event":"test"}');
+ * // Returns: "sha256=a1b2c3d4..."
+ * ```
+ */
+export function signWebhookPayload(secret: string, payload: string | Buffer): string {
+  const hmac = createHmac('sha256', secret);
+  hmac.update(payload);
+  return `sha256=${hmac.digest('hex')}`;
+}
+
+/**
+ * @notice Generates a versioned signature for a webhook payload including a timestamp.
+ * @param secret The shared secret key
+ * @param body The raw request body string
+ * @param timestamp The timestamp string
+ * @returns A signature string
+ */
+export function signPayload(secret: string, body: string, timestamp: string): string {
+  return signWebhookPayload(secret, `${timestamp}.${body}`);
+}
+
+/**
+ * @notice Verifies an HMAC-SHA256 signature against a webhook payload.
+ * @dev Uses timing-safe comparison to prevent timing attacks.
+ *
+ * @param secret The shared secret key
+ * @param payload The raw request body (string or Buffer)
+ * @param signature The signature to verify (format: `sha256=<hex>`)
+ * @returns `true` if the signature is valid, `false` otherwise
+ *
+ * @example
+ * ```typescript
+ * const isValid = verifyWebhookPayload('my-secret', body, 'sha256=a1b2c3d4...');
+ * ```
+ */
+export function verifyWebhookPayload(
+  secret: string,
+  payload: string | Buffer,
+  signature: string | string[]
+): boolean {
+  // Handle edge cases - allow empty string secret but not undefined/null
+  if (secret === undefined || secret === null || !payload || !signature) {
+    return false;
+  }
+
+  // Handle array signature (take first element)
+  const signatureStr = Array.isArray(signature) ? signature[0] : signature;
+  if (!signatureStr || typeof signatureStr !== 'string') {
+    return false;
+  }
+
+  // Validate signature format
+  if (!signatureStr.startsWith('sha256=')) {
+    return false;
+  }
+
+  const expectedSignature = signWebhookPayload(secret, payload);
+
+  // Ensure signatures are the same length before comparison
+  if (signatureStr.length !== expectedSignature.length) {
+    return false;
+  }
+
+  // Constant-time comparison to prevent timing attacks
+  try {
+    const signatureBuffer = Buffer.from(signatureStr, 'utf8');
+    const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+    return timingSafeEqual(signatureBuffer, expectedBuffer);
+  } catch {
+    // If buffers can't be compared, fall back to safe false
+    return false;
+  }
+}
+
+/**
+ * @notice Extracts the signature from request headers.
+ * @dev Supports both 'X-Revora-Signature' and standard 'X-Webhook-Signature' headers.
+ *
+ * @param headers The request headers object (case-insensitive lookup)
+ * @returns The signature string or undefined if not found
+ *
+ * @example
+ * ```typescript
+ * const signature = extractSignatureFromHeaders(req.headers);
+ * ```
+ */
+export function extractSignatureFromHeaders(
+  headers: Record<string, string | string[] | undefined>
+): string | undefined {
+  // Common webhook signature header names
+  const headerNames = [
+    'x-revora-signature',
+    'x-webhook-signature',
+    'x-signature',
+    'x-hub-signature-256', // GitHub-style
+  ];
+
+  for (const name of headerNames) {
+    const value = headers[name] ?? headers[name.toLowerCase()];
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (Array.isArray(value) && value.length > 0) {
+      return value[0];
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * @notice Validates and verifies a webhook signature, throwing on failure.
+ * @dev Use this when you want explicit error handling for different failure modes.
+ *
+ * @param secret The shared secret key
+ * @param payload The raw request body
+ * @param signature The signature to verify
+ * @throws {WebhookSignatureError} When signature is missing, malformed, or invalid
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   assertValidWebhookSignature(secret, body, signature);
+ *   // Process webhook...
+ * } catch (error) {
+ *   if (error instanceof WebhookSignatureError) {
+ *     // Handle specific verification failure
+ *   }
+ * }
+ * ```
+ */
+export function assertValidWebhookSignature(
+  secret: string,
+  payload: string | Buffer,
+  signature: string | undefined
+): void {
+  if (!signature) {
+    throw new WebhookSignatureError(
+      'Webhook signature is missing',
+      'MISSING_SIGNATURE'
+    );
+  }
+
+  if (!signature.startsWith('sha256=')) {
+    throw new WebhookSignatureError(
+      'Invalid signature format. Expected: sha256=<hex>',
+      'INVALID_FORMAT'
+    );
+  }
+
+  if (!verifyWebhookPayload(secret, payload, signature)) {
+    throw new WebhookSignatureError(
+      'Webhook signature verification failed',
+      'VERIFICATION_FAILED'
+    );
+  }
+}
+
+/**
+ * @notice Parses an expiry value into epoch milliseconds.
+ * @param expiry Date, ISO string, numeric string, or number in seconds/ms
+ * @returns Timestamp in epoch milliseconds or undefined if invalid/unspecified
+ */
+export function parseExpiryTimestamp(expiry: Date | string | number | undefined): number | undefined {
+  if (expiry === undefined || expiry === null || expiry === '') {
+    return undefined;
+  }
+  if (expiry instanceof Date) {
+    const time = expiry.getTime();
+    return isNaN(time) ? undefined : time;
+  }
+  if (typeof expiry === 'number') {
+    if (isNaN(expiry)) return undefined;
+    return expiry < 1e11 ? expiry * 1000 : expiry;
+  }
+  if (typeof expiry === 'string') {
+    const trimmed = expiry.trim();
+    if (!trimmed) return undefined;
+    if (/^\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      return num < 1e11 ? num * 1000 : num;
+    }
+    const parsed = Date.parse(trimmed);
+    return isNaN(parsed) ? undefined : parsed;
+  }
+  return undefined;
+}
+
+/**
+ * @notice Configuration for dual-key signature verification.
+ */
+export interface DualKeyConfig {
+  /** Current primary secret key */
+  secret: string;
+  /** Secondary next secret key for key rotation window */
+  nextSecret?: string;
+  /** Expiry timestamp/date for secondary key acceptance window */
+  nextSecretExpiry?: Date | string | number;
+}
+
+/**
+ * @notice Result of dual-key signature verification.
+ */
+export interface DualKeyVerificationResult {
+  valid: boolean;
+  verifiedByKey?: 'current' | 'next';
+  expired?: boolean;
+}
+
+/**
+ * @notice Configuration for outbound dual-key signing during HMAC rotation.
+ * @dev Used by the outbox dispatcher when a rotation overlap window is active.
+ *
+ * During the overlap window the dispatcher signs with the **current** key only,
+ * but exposes the previous key so that receivers can validate either.
+ */
+export interface OutboundSigningConfig {
+  /** Current active HMAC secret — always used for signing. */
+  currentSecret: string;
+  /**
+   * Previous secret still valid during the overlap window.
+   * Receivers MUST accept signatures produced with either key until
+   * `overlapExpiresAtMs` elapses.
+   */
+  previousSecret?: string;
+  /**
+   * Epoch ms at which the previous secret's acceptance window closes.
+   * Must be set when `previousSecret` is provided.
+   */
+  overlapExpiresAtMs?: number;
+}
+
+/**
+ * @notice Result of an outbound signing operation.
+ */
+export interface OutboundSigningResult {
+  /** The generated signature string (`sha256=<hex>`). */
+  signature: string;
+  /** The version of the secret that produced this signature. */
+  usedKey: 'current';
+  /**
+   * When `true`, a rotation overlap window is active and the receiver should
+   * accept signatures produced with either the current or previous secret.
+   */
+  overlapWindowActive: boolean;
+  /**
+   * Epoch ms at which the overlap window closes (0 when no overlap is active).
+   */
+  overlapExpiresAtMs: number;
+}
+
+/**
+ * @notice Signs a webhook payload using the outbound signing config.
+ * @dev Always signs with the `currentSecret`.  The previous key is only
+ *   surfaced so that receivers can build their own dual-key verification config.
+ *
+ * Signing always uses the current secret regardless of whether the overlap
+ * window is active — this ensures all new deliveries carry the up-to-date
+ * signature.  Receivers that still have the old key cached can still verify
+ * in-flight deliveries using the overlap window information.
+ *
+ * @param config  Outbound signing configuration (current + optional previous key).
+ * @param body    Raw request body string.
+ * @param timestamp Timestamp string for replay protection.
+ * @returns Signing result including overlap window metadata.
+ *
+ * @example
+ * ```typescript
+ * const result = signOutboundPayload(rotationSvc.getOutboundSigningConfig(), body, timestamp);
+ * // result.signature → attach to X-Revora-Signature header
+ * // result.overlapWindowActive → inform receiver that old key is still valid
+ * ```
+ */
+export function signOutboundPayload(
+  config: OutboundSigningConfig,
+  body: string,
+  timestamp: string,
+): OutboundSigningResult {
+  const signature = signPayload(config.currentSecret, body, timestamp);
+
+  const overlapActive =
+    config.previousSecret !== undefined &&
+    config.overlapExpiresAtMs !== undefined &&
+    Date.now() <= config.overlapExpiresAtMs;
+
+  return {
+    signature,
+    usedKey: 'current',
+    overlapWindowActive: overlapActive,
+    overlapExpiresAtMs: overlapActive ? config.overlapExpiresAtMs! : 0,
+  };
+}
+
+/**
+ * @notice Verifies an HMAC signature against payload with dual-key rotation support.
+ * @dev Tries primary secret first. If failed, tries nextSecret if not expired.
+ *
+ * @param config Secret configuration object containing primary and next key
+ * @param payload Raw request payload
+ * @param signature Signature string from headers
+ * @returns Verification result including which key verified the signature
+ */
+export function verifyWebhookPayloadDualKey(
+  config: DualKeyConfig,
+  payload: string | Buffer,
+  signature: string | string[]
+): DualKeyVerificationResult {
+  if (verifyWebhookPayload(config.secret, payload, signature)) {
+    return { valid: true, verifiedByKey: 'current' };
+  }
+
+  if (config.nextSecret) {
+    const expiryMs = parseExpiryTimestamp(config.nextSecretExpiry);
+    const isExpired = expiryMs !== undefined && Date.now() > expiryMs;
+
+    if (!isExpired && verifyWebhookPayload(config.nextSecret, payload, signature)) {
+      return { valid: true, verifiedByKey: 'next' };
+    }
+
+    if (isExpired && verifyWebhookPayload(config.nextSecret, payload, signature)) {
+      return { valid: false, expired: true };
+    }
+  }
+
+  return { valid: false };
+}
+
+/**
+ * @notice Configuration options for webhook signature verification.
+ */
+export interface WebhookVerificationConfig {
+  /** The shared secret key */
+  secret: string;
+  /** Next secret key for key rotation window */
+  nextSecret?: string;
+  /** Expiry timestamp/date for next key acceptance window */
+  nextSecretExpiry?: Date | string | number;
+  /** Optional metric counter name to emit on verification (e.g. 'kyc.webhook.verified_by_key') */
+  metricName?: string;
+  /** Custom header name for the signature (default: 'x-revora-signature') */
+  headerName?: string;
+  /** Maximum payload size in bytes (default: 1MB) */
+  maxPayloadSize?: number;
+  /** Whether to require a timestamp header for replay protection */
+  requireTimestamp?: boolean;
+  /** Maximum age of webhook in milliseconds for replay protection (default: 5 minutes) */
+  maxAgeMs?: number;
+  /**
+   * Allowed clock drift for future-dated timestamps in milliseconds (default: 30 seconds).
+   * Sender clocks may be slightly ahead of the receiver — this window tolerates that skew
+   * without opening a replay window large enough to be exploitable.
+   */
+  clockSkewMs?: number;
+}
+
+/**
+ * @notice Result of a webhook verification operation.
+ */
+export interface WebhookVerificationResult {
+  valid: boolean;
+  verifiedByKey?: 'current' | 'next';
+  error?: WebhookSignatureError;
+  /** Parsed timestamp if present and valid */
+  timestamp?: Date;
+}
+
+/**
+ * @notice Comprehensive webhook verification with optional replay protection.
+ * @dev Validates signature, payload size, and optionally timestamp for replay protection.
+ *
+ * @param config Verification configuration
+ * @param payload The raw request body
+ * @param headers The request headers
+ * @returns Verification result with details
+ *
+ * @example
+ * ```typescript
+ * const result = verifyWebhook({
+ *   secret: 'my-secret',
+ *   nextSecret: 'next-secret',
+ *   nextSecretExpiry: '2026-12-31T23:59:59Z',
+ *   metricName: 'kyc.webhook.verified_by_key',
+ *   requireTimestamp: true,
+ *   maxAgeMs: 300000 // 5 minutes
+ * }, body, headers);
+ *
+ * if (!result.valid) {
+ *   // Handle verification failure
+ * }
+ * ```
+ */
+export function verifyWebhook(
+  config: WebhookVerificationConfig,
+  payload: string | Buffer,
+  headers: Record<string, string | string[] | undefined>
+): WebhookVerificationResult {
+  const {
+    secret,
+    nextSecret,
+    nextSecretExpiry,
+    metricName,
+    headerName = 'x-revora-signature',
+    maxPayloadSize = 1024 * 1024, // 1MB default
+    requireTimestamp = false,
+    maxAgeMs = 5 * 60 * 1000, // 5 minutes default
+    clockSkewMs = 30 * 1000, // 30 seconds tolerance for sender clock drift
+  } = config;
+
+  // Check payload size
+  const payloadSize = Buffer.isBuffer(payload) ? payload.length : Buffer.byteLength(payload);
+  if (payloadSize > maxPayloadSize) {
+    return {
+      valid: false,
+      error: new WebhookSignatureError(
+        `Payload exceeds maximum size of ${maxPayloadSize} bytes`,
+        'INVALID_FORMAT'
+      ),
+    };
+  }
+
+  // Extract signature (handle both string and array header values)
+  const rawSignature = headers[headerName.toLowerCase()] ?? extractSignatureFromHeaders(headers);
+  const signature = Array.isArray(rawSignature) ? rawSignature[0] : rawSignature;
+
+  if (!signature) {
+    return {
+      valid: false,
+      error: new WebhookSignatureError(
+        `Missing signature header: ${headerName}`,
+        'MISSING_SIGNATURE'
+      ),
+    };
+  }
+
+  // Verify signature using dual-key check
+  const dualKeyResult = verifyWebhookPayloadDualKey(
+    { secret, nextSecret, nextSecretExpiry },
+    payload,
+    signature
+  );
+
+  if (!dualKeyResult.valid) {
+    const errorMsg = dualKeyResult.expired
+      ? 'Signature verification failed: secondary key expired'
+      : 'Signature verification failed';
+    return {
+      valid: false,
+      error: new WebhookSignatureError(errorMsg, 'VERIFICATION_FAILED'),
+    };
+  }
+
+  const verifiedByKey = dualKeyResult.verifiedByKey ?? 'current';
+
+  // Emit metric if configured
+  if (metricName) {
+    try {
+      globalMetrics.incrementCounter(metricName, { key: verifiedByKey });
+    } catch {
+      // Ignore metric errors to not interrupt verification flow
+    }
+  }
+
+  // Optional timestamp/replay protection
+  let timestamp: Date | undefined;
+  if (requireTimestamp) {
+    const timestampHeader = headers['x-webhook-timestamp'] ?? headers['x-revora-timestamp'];
+    const timestampStr = Array.isArray(timestampHeader) ? timestampHeader[0] : timestampHeader;
+
+    if (!timestampStr) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          'Missing required timestamp header',
+          'INVALID_FORMAT'
+        ),
+      };
+    }
+
+    const timestampNum = parseInt(timestampStr, 10);
+    if (isNaN(timestampNum)) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          'Invalid timestamp format',
+          'INVALID_FORMAT'
+        ),
+      };
+    }
+
+    timestamp = new Date(timestampNum);
+    const now = Date.now();
+    const age = now - timestamp.getTime();
+
+    // Negative age means the timestamp is in the future (sender's clock ahead of ours).
+    // Allow up to clockSkewMs of forward drift to handle distributed-system clock variance.
+    if (age < -clockSkewMs || age > maxAgeMs) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          `Webhook timestamp outside acceptable window (max age: ${maxAgeMs}ms, clock skew: ${clockSkewMs}ms)`,
+          'VERIFICATION_FAILED'
+        ),
+      };
+    }
+  }
+
+  return { valid: true, verifiedByKey, timestamp };
+}

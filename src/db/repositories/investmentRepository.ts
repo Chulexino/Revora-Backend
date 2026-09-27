@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 
 /**
  * Investment entity
@@ -11,6 +11,10 @@ export interface Investment {
   asset: string;
   status: 'pending' | 'completed' | 'failed';
   tx_hash?: string;
+  /** Sanctions screening outcome recorded at submission time. */
+  screening_status?: 'passed' | 'blocked' | 'error' | null;
+  screening_list_version?: string | null;
+  screening_result?: Record<string, unknown> | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -35,6 +39,9 @@ export interface CreateInvestmentInput {
   asset: string;
   status?: 'pending' | 'completed' | 'failed';
   tx_hash?: string;
+  screening_status?: 'passed' | 'blocked' | 'error';
+  screening_list_version?: string;
+  screening_result?: Record<string, unknown>;
 }
 
 /**
@@ -94,10 +101,13 @@ export class InvestmentRepository {
         asset,
         status,
         tx_hash,
+        screening_status,
+        screening_list_version,
+        screening_result,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
       RETURNING *
     `;
 
@@ -109,6 +119,9 @@ export class InvestmentRepository {
       input.asset,
       status,
       input.tx_hash || null,
+      input.screening_status ?? null,
+      input.screening_list_version ?? null,
+      input.screening_result ? JSON.stringify(input.screening_result) : null,
     ];
 
     const result: QueryResult<Investment> = await this.db.query(query, values);
@@ -164,6 +177,53 @@ export class InvestmentRepository {
   }
 
   /**
+   * Lock an offering row FOR UPDATE within the provided transaction client.
+   * Returns the offering row (including max_investor_share_bps) or null if not found.
+   * @param client An active PoolClient with an open transaction
+   * @param offeringId Offering ID
+   */
+  async lockOffering(client: PoolClient, offeringId: string): Promise<{ max_investor_share_bps: number | null; total_raised: string } | null> {
+    const result = await client.query<{ max_investor_share_bps: number | null; total_raised: string }>(
+      'SELECT max_investor_share_bps, total_raised FROM offerings WHERE id = $1 FOR UPDATE',
+      [offeringId],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /**
+   * Sum all non-failed investments by a given investor in a given offering.
+   * Uses the provided transaction client so the read is part of the same tx.
+   * @param client An active PoolClient with an open transaction
+   */
+  async getInvestorTotalForOffering(client: PoolClient, investorId: string, offeringId: string): Promise<string> {
+    const result = await client.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total
+         FROM investments
+        WHERE investor_id = $1
+          AND offering_id = $2
+          AND status != 'failed'`,
+      [investorId, offeringId],
+    );
+    return result.rows[0]?.total ?? '0';
+  }
+
+  /**
+   * Sum non-failed investments for an investor in an offering (pool-backed).
+   * Used by the investment service for KYC-tier cap checks on new intents.
+   */
+  async sumInvestorCommitment(investorId: string, offeringId: string): Promise<string> {
+    const result = await this.db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total
+         FROM investments
+        WHERE investor_id = $1
+          AND offering_id = $2
+          AND status != 'failed'`,
+      [investorId, offeringId],
+    );
+    return result.rows[0]?.total ?? '0';
+  }
+
+  /**
    * Map database row to Investment entity
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -176,6 +236,9 @@ export class InvestmentRepository {
       asset: row.asset,
       status: row.status,
       tx_hash: row.tx_hash || undefined,
+      screening_status: row.screening_status ?? undefined,
+      screening_list_version: row.screening_list_version ?? undefined,
+      screening_result: row.screening_result ?? undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
