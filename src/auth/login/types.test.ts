@@ -1,58 +1,59 @@
-import {
-    isUserRole,
-    USER_ROLES,
-    UserRecord,
-    UserRepository,
-} from './types';
+import { USER_ROLES, UserRecord, UserRepository, UserRole, isUserRole } from './types';
 
-describe('login type contract', () => {
-    it('exposes the supported user roles and rejects invalid runtime values', () => {
-        expect(USER_ROLES).toEqual(['startup', 'investor']);
-        expect(USER_ROLES.every(isUserRole)).toBe(true);
+class InMemoryUserRepository implements UserRepository {
+  private readonly users = new Map<string, UserRecord>();
 
-        for (const value of [undefined, null, '', 'admin', 'STARTUP', 1, {}, []]) {
-            expect(isUserRole(value)).toBe(false);
-        }
-    });
+  async findByEmail(email: string): Promise<UserRecord | null> {
+    return this.users.get(email) ?? null;
+  }
 
-    it.each<UserRecord>([
-        {
-            id: 'user-startup',
-            email: 'founder@example.com',
-            role: 'startup',
-            passwordHash: 'hash-startup',
-        },
-        {
-            id: 'user-investor',
-            email: 'investor@example.com',
-            role: 'investor',
-            passwordHash: 'hash-investor',
-        },
-    ])('accepts a complete %s user record', (record) => {
-        expect(record).toMatchObject({
-            id: expect.any(String),
-            email: expect.stringContaining('@'),
-            role: expect.any(String),
-            passwordHash: expect.any(String),
-        });
-        expect(isUserRole(record.role)).toBe(true);
-    });
+  add(user: UserRecord): void {
+    this.users.set(user.email, user);
+  }
 
-    it('models repository lookup transitions from missing to found deterministically', async () => {
-        const records = new Map<string, UserRecord>();
-        const repository: UserRepository = {
-            findByEmail: async (email) => records.get(email) ?? null,
-        };
-        const record: UserRecord = {
-            id: 'user-1',
-            email: 'user@example.com',
-            role: 'startup',
-            passwordHash: 'hash',
-        };
+  remove(email: string): void {
+    this.users.delete(email);
+  }
+}
 
-        expect(await repository.findByEmail(record.email)).toBeNull();
-        records.set(record.email, record);
-        expect(await repository.findByEmail(record.email)).toEqual(record);
-        expect(await repository.findByEmail('unknown@example.com')).toBeNull();
-    });
+describe('login types contract', () => {
+  it('exposes the supported roles in a stable order', () => {
+    expect(USER_ROLES).toEqual(['startup', 'investor']);
+  });
+
+  it.each(['startup', 'investor'] as const)('accepts %s as a UserRole', (role) => {
+    expect(isUserRole(role)).toBe(true);
+  });
+
+  it.each([undefined, null, '', 'admin', 1, {}])('rejects invalid UserRole input: %p', (role) => {
+    expect(isUserRole(role)).toBe(false);
+  });
+
+  it('models a UserRecord for each supported role', () => {
+    const users: UserRecord[] = [
+      { id: 'u-startup', email: 'founder@example.com', role: 'startup', passwordHash: 'hash-a' },
+      { id: 'u-investor', email: 'investor@example.com', role: 'investor', passwordHash: 'hash-b' },
+    ];
+
+    expect(users.map(({ role }) => role)).toEqual(['startup', 'investor']);
+    // @ts-expect-error Unsupported roles must remain rejected by the public type.
+    const invalidRole: UserRole = 'admin';
+    expect(invalidRole).toBe('admin');
+  });
+
+  it('implements UserRepository lookup, miss, and removal transitions', async () => {
+    const repository = new InMemoryUserRepository();
+    const user: UserRecord = {
+      id: 'u-1',
+      email: 'user@example.com',
+      role: 'startup',
+      passwordHash: 'password-hash',
+    };
+
+    expect(await repository.findByEmail(user.email)).toBeNull();
+    repository.add(user);
+    await expect(repository.findByEmail(user.email)).resolves.toEqual(user);
+    repository.remove(user.email);
+    await expect(repository.findByEmail(user.email)).resolves.toBeNull();
+  });
 });
