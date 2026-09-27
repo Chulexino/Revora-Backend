@@ -11,7 +11,7 @@
 
 import { Pool } from 'pg';
 import { DisposalRepository } from './disposalRepository';
-import { DisposalStrategy } from '../../services/taxation/types';
+import type { DisposalStrategy } from '../../services/taxation/types';
 
 function makeMockClient(queryMock: jest.Mock = jest.fn()) {
   return { query: queryMock, release: jest.fn() };
