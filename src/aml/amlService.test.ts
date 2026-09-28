@@ -728,4 +728,138 @@ describe('AMLService', () => {
       expect(queue[0].first_approver_id).toBeUndefined();
     });
   });
+
+  describe('OFAC Review Failure Handling', () => {
+    const createReview = async (expires_at?: Date) => service.createOFACReview({
+      alert_id: 'alert_ofac_1',
+      investor_id: 'investor_1',
+      matched_name: 'John Smith',
+      list_entry_id: 'ofac_sdn_123',
+      rationale: 'Documented legal name collision with verified date of birth mismatch.',
+      expires_at,
+    }, 'case_creator');
+
+    it.each([
+      ['empty string', ''],
+      ['single space', ' '],
+      ['spaces only', '   '],
+      ['tab only', '\t'],
+      ['newline only', '\n'],
+      ['mixed whitespace', ' \t\r\n '],
+      ['non-breaking space', '\u00a0'],
+    ])('rejects a %s rationale without touching the repository or audit trail', async (_label, rationale) => {
+      const review = await createReview();
+      const before = auditRepo.getEvents();
+      const findByIdSpy = jest.spyOn(ofacReviewRepo, 'findById');
+      const approveSpy = jest.spyOn(ofacReviewRepo, 'approve');
+
+      await expect(
+        service.approveOFACReview(review.id, 'officer_1', rationale)
+      ).rejects.toThrow('OFAC clearance rationale is required');
+
+      // The guard must run before any repository read/write or audit write.
+      expect(findByIdSpy).not.toHaveBeenCalled();
+      expect(approveSpy).not.toHaveBeenCalled();
+      expect(auditRepo.getEvents()).toHaveLength(before.length);
+      expect(review.status).toBe('pending_first_approval');
+      expect(review.first_approver_id).toBeUndefined();
+    });
+
+    it('validates the rationale before resolving a missing OFAC repository', async () => {
+      const noRepoService = new AMLService(
+        ruleRepo as unknown as AMLRuleRepository,
+        alertRepo as unknown as AMLAlertRepository,
+        evaluator as unknown as RuleEvaluator,
+        auditRepo,
+        'test_user'
+      );
+
+      // A blank rationale is a caller error regardless of wiring; the rationale
+      // guard must win over the "repository is not configured" guard.
+      await expect(
+        noRepoService.approveOFACReview('ofac_any', 'officer_1', '   ')
+      ).rejects.toThrow('OFAC clearance rationale is required');
+    });
+
+    it('throws when the OFAC review repository is not configured', async () => {
+      const noRepoService = new AMLService(
+        ruleRepo as unknown as AMLRuleRepository,
+        alertRepo as unknown as AMLAlertRepository,
+        evaluator as unknown as RuleEvaluator,
+        auditRepo,
+        'test_user'
+      );
+
+      await expect(noRepoService.createOFACReview({
+        alert_id: 'alert_ofac_1',
+        investor_id: 'investor_1',
+        matched_name: 'John Smith',
+        rationale: 'Documented legal name collision with verified date of birth mismatch.',
+      })).rejects.toThrow('OFAC review repository is not configured');
+
+      await expect(noRepoService.getOFACReviewQueue()).rejects.toThrow(
+        'OFAC review repository is not configured'
+      );
+
+      await expect(
+        noRepoService.approveOFACReview('ofac_any', 'officer_1', 'Valid rationale that is not blank.')
+      ).rejects.toThrow('OFAC review repository is not configured');
+
+      // Wiring failures must not emit audit events claiming compliance activity.
+      expect(auditRepo.getEvents()).toHaveLength(0);
+    });
+
+    it('returns an empty queue when no reviews are pending and excludes cleared reviews', async () => {
+      // Empty-result branch: no reviews queued at all.
+      await expect(service.getOFACReviewQueue()).resolves.toEqual([]);
+
+      const review = await createReview();
+      expect(await service.getOFACReviewQueue()).toHaveLength(1);
+
+      await service.approveOFACReview(review.id, 'officer_1', 'First review rationale is complete.');
+      await service.approveOFACReview(review.id, 'officer_2', 'Second review confirms false positive.');
+
+      // Cleared reviews are no longer actionable and must drop out of the queue.
+      const queue = await service.getOFACReviewQueue();
+      expect(queue).toHaveLength(0);
+      expect(queue.find(entry => entry.id === review.id)).toBeUndefined();
+    });
+
+    it('accepts the shortest non-blank rationale and preserves it verbatim', async () => {
+      const review = await createReview();
+      const rationale = ' x '; // 1 non-whitespace char, padded -> valid and stored as-is
+
+      const first = await service.approveOFACReview(review.id, 'officer_1', rationale);
+
+      expect(first.status).toBe('pending_second_approval');
+      expect(first.first_approval_rationale).toBe(rationale);
+
+      const firstEvent = auditRepo.getEvents().find(
+        event => event.action === 'ofac_review_first_approved'
+      );
+      expect(firstEvent?.resource).toBe(`ofac_review/${review.id}`);
+      expect(firstEvent?.details).toMatchObject({
+        review_id: review.id,
+        alert_id: 'alert_ofac_1',
+        investor_id: 'investor_1',
+        status: 'pending_second_approval',
+        first_approver_id: 'officer_1',
+        rationale,
+      });
+
+      const cleared = await service.approveOFACReview(review.id, 'officer_2', 'Second review confirms.');
+      expect(cleared.status).toBe('cleared');
+
+      const clearedEvent = auditRepo.getEvents().find(
+        event => event.action === 'ofac_review_cleared'
+      );
+      expect(clearedEvent?.details).toMatchObject({
+        review_id: review.id,
+        status: 'cleared',
+        first_approver_id: 'officer_1',
+        second_approver_id: 'officer_2',
+        rationale: 'Second review confirms.',
+      });
+    });
+  });
 });
