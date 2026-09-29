@@ -19,6 +19,15 @@ import {
   UpdateCaseInput,
   SemVer,
 } from './types';
+import {
+  RECORDED_PROVIDERS,
+  assertNoPiiLeaks,
+  findPiiLeaks,
+  interactionByLabel,
+  replayInteractions,
+  replayProvider,
+} from './fixtures/replay';
+import { createRedactionContext, redactObject } from './fixtures/redaction';
 
 // Mock repositories
 class MockRuleRepository {
@@ -729,3 +738,180 @@ describe('AMLService', () => {
     });
   });
 });
+
+  /**
+   * Provider fixture replay (#755).
+   *
+   * The recorder/redaction harness landed in #594 but was only ever exercised
+   * by its own unit tests — `amlService.test.ts` never replayed a trace, so a
+   * fixture that leaked PII could still land green. These tests replay every
+   * checked-in provider fixture in CI and fail the build on any leak.
+   */
+  describe('Provider Fixture Replay', () => {
+    it('should ship a fixture for every recorded provider', async () => {
+      expect(RECORDED_PROVIDERS.length).toBeGreaterThan(0);
+
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        expect(fixture.provider).toBe(provider);
+      }
+    });
+
+    it('should leak no PII or credentials in any recorded fixture', async () => {
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        expect({ provider, leaks: findPiiLeaks(fixture) }).toEqual({
+          provider,
+          leaks: [],
+        });
+        expect(() => assertNoPiiLeaks(fixture)).not.toThrow();
+      }
+    });
+
+    it('should replay interactions in recorded order with a non-empty body', async () => {
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        const interactions = replayInteractions(fixture);
+
+        expect(interactions.length).toBeGreaterThan(0);
+        for (const interaction of interactions) {
+          expect(interaction.label).toBeTruthy();
+          expect(interaction.request.method).toMatch(/^(GET|POST|PUT|PATCH|DELETE)$/);
+          expect(interaction.request.path).toMatch(/^\//);
+          expect(interaction.response.status).toBeGreaterThanOrEqual(100);
+          expect(interaction.response.status).toBeLessThan(600);
+          expect(interaction.request.timestamp).toMatch(
+            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+          );
+        }
+      }
+    });
+
+    it('should replay deterministically across repeated loads', async () => {
+      const first = await replayProvider('sumsub');
+      const second = await replayProvider('sumsub');
+
+      expect(JSON.stringify(replayInteractions(first))).toBe(
+        JSON.stringify(replayInteractions(second)),
+      );
+    });
+
+    it('should allow per-label lookup for adapter assertions', async () => {
+      const sumsub = await replayProvider('sumsub');
+      const jumio = await replayProvider('jumio');
+
+      expect(interactionByLabel(sumsub, 'applicant_created')).toBeDefined();
+      expect(interactionByLabel(sumsub, 'check_complete')).toBeDefined();
+      expect(interactionByLabel(jumio, 'verify_customer')).toBeDefined();
+      expect(interactionByLabel(sumsub, 'does_not_exist')).toBeUndefined();
+    });
+
+    it('should keep provider error responses replayable for negative paths', async () => {
+      // Error traces must survive redaction too: an adapter's failure mapping is
+      // as much of a contract as its success mapping.
+      const jumio = await replayProvider('jumio');
+      const notFound = interactionByLabel(jumio, 'transaction_not_found');
+
+      expect(notFound).toBeDefined();
+      expect(notFound!.response.status).toBe(404);
+      expect(() => assertNoPiiLeaks(jumio)).not.toThrow();
+    });
+
+    it('should redact a raw PII payload through the engine with no leak', async () => {
+      // Round-trips a realistic un-redacted vendor payload through the
+      // redactor, then asserts the leak scanner catches nothing.
+      const ctx = createRedactionContext();
+      const raw = {
+        applicant: {
+          firstName: 'Jane',
+          lastName: 'Doe',
+          email: 'jane.doe@example.com',
+          phone: '+14155552671',
+          dateOfBirth: '1985-04-12',
+          address: '742 Evergreen Terrace, Springfield',
+        },
+        document: {
+          type: 'passport',
+          number: 'X1234567',
+        },
+        meta: {
+          ipAddress: '203.0.113.42',
+          apiKey: 'sk_live_9f8a7b6c5d4e3f2a',
+          sessionToken: 'eyJhbGciOiJIUzI1NiJ9.payload.sig',
+        },
+      };
+
+      const redacted = redactObject(raw, ctx);
+
+      const serialized = JSON.stringify(redacted);
+      expect(serialized).not.toContain('jane.doe@example.com');
+      expect(serialized).not.toContain('+14155552671');
+      expect(serialized).not.toContain('203.0.113.42');
+      expect(serialized).not.toContain('sk_live_9f8a7b6c5d4e3f2a');
+      expect(serialized).not.toContain('Evergreen Terrace');
+      expect(serialized).not.toContain('1985-04-12');
+
+      // Non-PII enums must survive redaction untouched.
+      const typed = redacted as typeof raw;
+      expect(typed.document.type).toBe('passport');
+    });
+
+    it('should detect a leak when raw PII is injected into a fixture', async () => {
+      // Negative control: proves the scanner actually fails, so the passing
+      // assertions above are not vacuous.
+      const fixture = await replayProvider('jumio');
+      const tampered = {
+        ...fixture,
+        interactions: fixture.interactions.map((interaction, i) =>
+          i === 0
+            ? {
+                ...interaction,
+                response: {
+                  ...interaction.response,
+                  body: { ...(interaction.response.body as object), email: 'leak@example.com' },
+                },
+              }
+            : interaction,
+        ),
+      };
+
+      const leaks = findPiiLeaks(tampered);
+      expect(leaks.length).toBeGreaterThan(0);
+      expect(leaks.join('\n')).toMatch(/email/);
+      expect(() => assertNoPiiLeaks(tampered)).toThrow(/leaks PII/);
+    });
+
+    it('should detect credential-shaped headers left un-redacted', async () => {
+      const fixture = await replayProvider('sumsub');
+      const tampered = {
+        ...fixture,
+        interactions: fixture.interactions.map((interaction, i) =>
+          i === 0
+            ? {
+                ...interaction,
+                request: {
+                  ...interaction.request,
+                  headers: { ...interaction.request.headers, Authorization: 'Bearer eyJhbGciOiJI' },
+                },
+              }
+            : interaction,
+        ),
+      };
+
+      expect(findPiiLeaks(tampered).length).toBeGreaterThan(0);
+    });
+
+    it('should not flag benign recorded values as leaks', () => {
+      // Guards the scanner against becoming so noisy that real leaks get
+      // dismissed as false positives.
+      const clean = {
+        provider: 'sumsub',
+        version: 1 as const,
+        recordedAt: '2026-01-15T12:00:00.000Z',
+        interactions: [],
+        redaction: { totalRedactions: 0, placeholderCount: 0 },
+      };
+
+      expect(findPiiLeaks(clean)).toEqual([]);
+    });
+  });
