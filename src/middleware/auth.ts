@@ -507,6 +507,14 @@ function getAdminPubKeys(): ReturnType<
   }
 }
 
+/**
+ * @notice Reset the cached admin Ed25519 public keys.
+ * @dev Primarily intended for testing key reloading and configuration error paths.
+ */
+export function resetAdminPubKeysCache(): void {
+  adminPubKeysCache = null;
+}
+
 // ── Action → expected HTTP route segment map (for cross-checking) ────────────
 const ACTION_TO_PATH_SEGMENT: Record<
   AdminSignedStatusTransitionPayload["action"],
