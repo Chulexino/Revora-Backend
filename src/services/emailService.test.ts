@@ -74,10 +74,11 @@ describe('SendGridEmailProvider', () => {
     });
 
     it('should throw an error if SendGrid API returns an error', async () => {
+        const errorData = { errors: [{ message: 'Unauthorized' }] };
         (global.fetch as jest.Mock).mockResolvedValue({
             ok: false,
             status: 401,
-            json: async () => ({ errors: [{ message: 'Unauthorized' }] }),
+            json: async () => errorData,
         });
 
         await expect(
@@ -86,7 +87,21 @@ describe('SendGridEmailProvider', () => {
                 subject: 'Hello',
                 body: 'World',
             })
-        ).rejects.toThrow('SendGrid error: 401');
+        ).rejects.toThrow(`SendGrid error: 401 ${JSON.stringify(errorData)}`);
+    });
+
+    it('preserves the status when an error response has no JSON body', async () => {
+        (global.fetch as jest.Mock).mockResolvedValue({
+            ok: false,
+            status: 503,
+            json: async () => { throw new SyntaxError('invalid JSON'); },
+        });
+
+        await expect(providerHost.send({
+            to: 'recipient@example.com',
+            subject: 'Hello',
+            body: 'World',
+        })).rejects.toThrow('SendGrid error: 503 {}');
     });
 });
 
@@ -271,5 +286,31 @@ describe('createEmailService', () => {
         });
 
         expect(service).toBeInstanceOf(EmailService);
+    });
+
+    it('rejects SMTP configuration without a host', () => {
+        expect(() => createEmailService({
+            NODE_ENV: 'production',
+            EMAIL_PROVIDER: 'smtp',
+            SMTP_PORT: 587,
+        })).toThrow('SMTP_HOST is required for EMAIL_PROVIDER=smtp');
+    });
+
+    it.each([0, -1, 65536, 'not-a-port'])('rejects invalid SMTP port %p', (port) => {
+        expect(() => createEmailService({
+            NODE_ENV: 'production',
+            EMAIL_PROVIDER: 'smtp',
+            SMTP_HOST: 'smtp.example.com',
+            SMTP_PORT: port,
+        })).toThrow('SMTP_PORT must be a valid TCP port for EMAIL_PROVIDER=smtp');
+    });
+
+    it.each([1, 65535])('accepts the valid SMTP port boundary %i', (port) => {
+        expect(() => createEmailService({
+            NODE_ENV: 'production',
+            EMAIL_PROVIDER: 'smtp',
+            SMTP_HOST: 'smtp.example.com',
+            SMTP_PORT: port,
+        })).not.toThrow();
     });
 });
